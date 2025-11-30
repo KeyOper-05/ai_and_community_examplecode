@@ -1,0 +1,125 @@
+{
+  "//": "expand the model: ",
+  "model_number_expd_input": 53,
+  "model_number_expd_output": 55,
+  "num_epochs_model": 20,
+  "n_model_samples": 50000,
+  "a1_scale": 1.0,
+
+  "model_number_input": 58,
+  "model_number_output": 59,
+  "i_pretrainted": 1,
+  "i_save": 1,
+
+  "num_samples_expand_p": 1.0,
+  "num_samples_expand_v": 1.0,
+
+  "//comment": "training NN related",
+  "num_iter": 5,
+  "num_samples_policy": 100000,
+  "num_samples_value": 100000,
+  "num_epochs_draw": 1,
+  "num_epochs_initial": 1,
+  "num_epochs_v": 10,
+  "num_epochs_p": 10,
+  "n_v_sim": 50,
+  "n_p_sim": 50,
+  "batch_size_v": 128,
+  "batch_size_p": 128,
+
+  "//": "params to bound the Sigmoid, as the scale difference b/t state variables can cause problem",
+  "x_low": 0.01,
+  "x_high": 0.99,
+
+  "//comment": "dimensional parameters for NN, k_dist is the dimension of distribution",
+  "n_input": 13,
+  "k_dist": 10,
+  "n_p_output": 1,
+  "n_v_output": 1,
+  "n1_p": 24,
+  "n2_p": 24,
+  "n1_v": 24,
+  "n2_v": 24,
+
+  "n_input_old": 8,
+  "k_dist_old": 5,
+  "n_p_output_old": 1,
+  "n_v_output_old": 1,
+  "n1_p_old": 12,
+  "n2_p_old": 12,
+  "n1_v_old": 12,
+  "n2_v_old": 12,
+
+  "//comment": "learning related",
+  "lr_factor": 0.999,
+  "lr_patience": 100,
+  "lr_domain": 0.01,
+  "lr_initial": 0.001,
+  "lr_value": 0.0025,
+  "lr_policy": 0.001,
+  "num_worker": 0,
+
+  "//comment": "preference",
+  "beta": 0.895,
+  "sigma": 2.0,
+  "alpha": 0.34,
+  "psi_l": 1.5,
+  "theta_l": 0.32,
+
+  "//comment": "technology",
+  "delta": 0.06,
+  "rho_z": 0.0,
+  "mu_z": 0.0,
+  "sigma_z": 0.05,
+
+  "//comment": "bounds for state variables",
+  "lambda_penalty": 0.5,
+  "a_pdf_penalty": 1.0,
+
+  "bounds": {
+      "z": {"min": 0.7, "max": 2.0},
+      "a": {"min": 0.0, "max": 1.52}
+  },
+
+  "//comment": "grids & pdf for a distribution",
+  "dist_a_mid_old": [1.350000e-01, 4.050000e-01, 6.750000e-01, 9.450000e-01, 1.215000e+00],
+  "dist_a_pdf_old": [2.700000e-03, 1.587000e-01, 6.048000e-01, 2.112000e-01, 2.260000e-02],
+  "dist_a_band_old": 0.15,
+  "//dist_a_mid": [1.350000e-01, 4.050000e-01, 6.750000e-01, 9.450000e-01, 1.215000e+00],
+  "//dist_a_pdf": [2.700000e-03, 1.587000e-01, 6.048000e-01, 2.112000e-01, 2.260000e-02],
+  "dist_a_mid": [2.300000e-01, 3.300000e-01, 4.300000e-01, 5.300000e-01, 6.300000e-01, 7.300000e-01, 8.300000e-01, 9.300000e-01, 1.030000e+00, 1.130000e+00],
+  "dist_a_pdf": [6.000000e-04, 4.500000e-03, 3.570000e-02, 1.292000e-01, 2.651000e-01, 3.220000e-01, 1.869000e-01, 5.030000e-02, 5.000000e-03, 7.000000e-04],
+  "dist_a_band": 0.15,
+  "dist_a_band_path": 0.15,
+
+  "//comment": "grids & pdf for z distribution",
+  "dist_z_mid": [1.0421, 1.0090, 1.0005, 0.9944, 0.9431],
+  "dist_z_pdf": [0.1629, 0.2327, 0.2385, 0.2385, 0.1274],
+
+  "//comment": "grids & pdf for tfp",
+  "n_tfp": 4,
+  "tfp_grid": [0.7865, 0.9231, 1.0834, 1.2715],
+  "tfp_transition": [0.9968, 0.0032, 0, 0, 0.0004, 0.9984, 0.0012,  0, 0.0000, 0.0012, 0.9984, 0.0004, 0.0000, 0.0000, 0.0032, 0.9968],
+  "rho_tfp": 0.95,
+  "eps_tfp": 0.025,
+
+  "//comment": "update of distribution",
+  "i_dist": 1,
+
+  "//comment": "punishment for exceeding the bound",
+  "i_punish": 0.1,
+  "bound_punish": 0.01,
+
+  "//": "# of samples for Monte Carlo simulation to compute the expected V",
+  "eu_samples": 10,
+  "i_training": 1,
+  "l2_penalty": 0.00001,
+
+  "u_eps": 0.001,
+
+  "//": "# simulations",
+  "n_z_sample": 10,
+  "n_sim_path": 5501,
+  "n_sim_step": 100,
+  "n_burn": 5400
+}
