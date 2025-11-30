@@ -75,8 +75,7 @@ class EulerTrainer:
             losses.append(np.log(avg_loss + 1e-10)) # Avoid log(0)
             self.scheduler.step(avg_loss)
             
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}: Log Euler Loss = {np.log(avg_loss + 1e-10):.4f}")
+            print(f"Epoch {epoch}: Log Euler Loss = {np.log(avg_loss + 1e-10):.4f}")
 
         # Plotting
         plt.figure()
@@ -199,18 +198,22 @@ class EulerTrainer:
         rhs_expected = (probs * mu_next_reshaped).sum(dim=1, keepdim=True)
 
         # ==========================
-        # 4. Loss Calculation
+        # 4. Loss Calculation (Using Fischer-Burmeister)
         # ==========================
+
+        val_a_prime = x_a1 
+        
         lhs = x_c0 ** (-config.sigma)
-        residuals = 1 - rhs_expected / lhs
+        val_euler_diff = lhs - rhs_expected
         
-        # Borrowing Constraint Handling
-        is_constrained = x_y0_policy[:, 0] < 1e-3
-        want_to_borrow = residuals > 0 # LHS > RHS means current C is too low (MU too high), want to borrow more
-        mask_ignore = is_constrained.unsqueeze(1) & want_to_borrow
+        val_euler_relative = 1.0 - rhs_expected / lhs
+
+        # 添加一个极小值 eps 防止 sqrt(0) 梯度 NaN
+        eps = 1e-8
+        fb_func = val_a_prime + val_euler_relative - torch.sqrt(val_a_prime**2 + val_euler_relative**2 + eps)
         
-        weights = torch.ones_like(residuals)
-        weights[mask_ignore] = 0.0
+        # Loss 是 FB 函数的平方
+        loss = torch.mean(fb_func ** 2)
         
-        loss = torch.mean((weights * residuals) ** 2)
+        return loss
         return loss
