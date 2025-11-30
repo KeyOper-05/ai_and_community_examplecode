@@ -25,6 +25,10 @@ import matplotlib.pyplot as plt
 import module_obj_bellman_v1
 from module_basic_v1 import Config, MyModel, plot_equm_funcs
 from module_training_bellman_v1 import EqumTrainer as BellmanTrainer
+# 引入新写的模块
+from module_training_euler import EulerTrainer
+
+# ... (初始化 Model 和 Config 同原代码) ...
 
 # when import the saved models from the expand_model_v1,
 # need to use "load_pretrained_new" to load the model as the way to save is a little different
@@ -71,6 +75,7 @@ dist_a_mid_values = config.dist_a_mid
 dist_a_mid = torch.tensor(dist_a_mid_values).unsqueeze(1).to(device)
 dist_a_mesh = dist_a_mid_values[1] - dist_a_mid_values[0]
 
+
 for i_iter in range(config.num_iter):
     print('iter:', i_iter)
 
@@ -100,6 +105,23 @@ for i_iter in range(config.num_iter):
                                            use_pretrained=i_load_pretrainted)
     model = decision_trainer.policy_bellman_training(config.n_p_sim, dist_a_mid, dist_a_mesh)
     model = decision_trainer.value_training(config.n_v_sim, dist_a_mid, dist_a_mesh)
+
+    # 实例化 DL Trainer
+    dl_trainer = EulerTrainer(model, device)
+
+    # 开始训练 (替代原来的 policy_bellman_training 和 value_training)
+    # 注意：DL 方法只需要训练 Policy Network，不需要 Value Network
+    model = dl_trainer.train_euler(
+        num_epochs=100,             # 可以根据收敛情况调整
+        batch_size=config.batch_size_p,
+        dist_a_mid=dist_a_mid_values,
+        dist_a_mesh=dist_a_mesh
+    )
+
+    # 保存模型
+    torch.save(model.state_dict(), f'models/trained_euler_nn_{config.model_number_output}.pth')
+
+    # ... (后续的 sim_path 和画图逻辑可以完全复用，因为它们只依赖 model) ...
 
     num_samples = 10000
     plotter = plot_equm_funcs(num_samples, config.k_dist, dist_a_mid, model, device)
