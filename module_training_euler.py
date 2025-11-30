@@ -1,6 +1,10 @@
 """
 module_training_euler.py
 Implements the Deep Learning method (minimizing Euler Residuals) for solving the KS model.
+Corrected version with:
+1. Explicit Expectation over TFP shocks.
+2. Kuhn-Tucker conditions for borrowing constraints.
+3. Consistent distribution updates.
 """
 import torch
 import torch.nn as nn
@@ -9,20 +13,19 @@ import numpy as np
 from torch.utils.data import DataLoader, TensorDataset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import module_basic_v1
-import module_obj_bellman_v1  # 复用其中的物理计算逻辑
+import module_obj_bellman_v1  # Reuse physical logic
 
-# 加载配置
+# Load configuration
 config = module_basic_v1.Config("config_v1.json")
 
 class EulerTrainer:
     def __init__(self, model, device=None):
         self.model = model
         self.device = device
-        # 复用原代码的辅助类，用于计算聚合变量和分布演变
+        # Reuse helper class for aggregates and distribution evolution
         self.obj_helper = module_obj_bellman_v1.define_objective(model, device)
         
-        # 定义优化器 (只优化 Policy Network)
-        # 注意：这里我们假设 MyModel 里的 policy_func 输出的是下一期资产 a'
+        # Optimizer: only optimize the policy network
         if isinstance(self.model, torch.nn.DataParallel):
             self.policy_net = self.model.module.policy_func
         else:
@@ -38,14 +41,13 @@ class EulerTrainer:
         losses = []
         domain_sampler = module_basic_v1.DomainSampling(self.obj_helper.ranges, device=self.device)
         
-        # 将 dist_a_mid 转换为 Tensor 以便计算
+        # Convert dist_a_mid to Tensor
         dist_a_mid_tensor = torch.tensor(dist_a_mid, device=self.device).view(-1, 1)
 
-        print("Starting Euler Equation Training...")
+        print("Starting Euler Equation Training (with Explicit Expectation)...")
         
         for epoch in range(num_epochs):
-            # 1. 采样状态 (State Sampling)
-            # 使用现有的采样器生成 (z, a, dist)
+            # 1. State Sampling
             x_data = domain_sampler.generate_samples(num_samples=config.num_samples_policy, num_k=config.k_dist)
             dataset = TensorDataset(x_data)
             data_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
@@ -56,25 +58,27 @@ class EulerTrainer:
             for batch_x, in data_loader:
                 batch_x = batch_x.to(self.device)
                 
-                # 2. 计算欧拉方程损失 (Euler Loss)
+                # 2. Calculate Euler Residuals
                 loss = self.calculate_euler_residuals(batch_x, dist_a_mid_tensor, dist_a_mesh)
                 
-                # 3. 反向传播 (Backpropagation)
+                # 3. Backpropagation
                 self.optimizer.zero_grad()
                 loss.backward()
+                # Clip gradients to prevent explosion, common in Euler methods
+                torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), max_norm=1.0)
                 self.optimizer.step()
                 
                 epoch_loss += loss.item()
                 total_batches += 1
             
             avg_loss = epoch_loss / total_batches
-            losses.append(np.log(avg_loss))
+            losses.append(np.log(avg_loss + 1e-10)) # Avoid log(0)
             self.scheduler.step(avg_loss)
             
             if epoch % 10 == 0:
-                print(f"Epoch {epoch}: Log Euler Loss = {np.log(avg_loss):.4f}")
+                print(f"Epoch {epoch}: Log Euler Loss = {np.log(avg_loss + 1e-10):.4f}")
 
-        # 绘图
+        # Plotting
         plt.figure()
         plt.plot(losses)
         plt.title('Euler Equation Residuals (Log Scale)')
@@ -87,111 +91,126 @@ class EulerTrainer:
 
     def calculate_euler_residuals(self, x_batch, dist_a_mid, dist_a_mesh):
         """
-        Calculate the MSE of the Euler equation residuals.
-        Residual = u'(c_t) - beta * E_t [ (1 + r_{t+1}) * u'(c_{t+1}) ]
+        Calculates Euler residuals using fully vectorized operations.
+        Replaces the slow for-loop over TFP branches with batch processing.
         """
         # ==========================
-        # Period t (Current Period)
+        # 1. Prepare Current State (t)
         # ==========================
-        # 1. 解析当前状态
-        # x_batch: [batch, z, a, dist...]
         x_z0, x_a0, x_dist0 = self.obj_helper.extract_state_variables(x_batch)
-        
-        # 这里的 TFP 逻辑需要参考原代码，假设 x_z0 包含了 idiosyncratic z，还需要 aggregate shock TFP?
-        # 原代码逻辑里 x_batch 的第0列是 z (idiosyncratic)。
-        # 但 aggregate TFP (x_tfp) 通常是独立采样的。为了简化，这里我们从 batch 里重新生成或提取。
-        # 参考 obj_sim_value，我们需要生成当前 TFP 和下一期 TFP。
-        
         n_batch = x_z0.size(0)
-        tfp_grid = torch.tensor(config.tfp_grid, device=self.device).view(-1, 1)
-        tfp_transition = torch.tensor(config.tfp_transition, device=self.device)
-        
-        # 随机采样当前的 Aggregate TFP (x_tfp0)
-        x_i_tfp0 = torch.randint(config.n_tfp, (n_batch, 1), device=self.device)
+        n_tfp = config.n_tfp
+
+        # TFP grids and transitions
+        tfp_grid = torch.tensor(config.tfp_grid, device=self.device).view(-1, 1) # [4, 1]
+        tfp_transition = torch.tensor(config.tfp_transition, device=self.device).view(n_tfp, n_tfp)
+
+        # Sample current TFP
+        x_i_tfp0 = torch.randint(n_tfp, (n_batch, 1), device=self.device)
         x_tfp0 = tfp_grid[x_i_tfp0.squeeze()].view(-1, 1)
 
-        # 2. 宏观聚合量 (Aggregates at t)
-        # 计算 total capital K
+        # Aggregates at t
         x_a0_total = (x_dist0 * dist_a_mid.T).sum(dim=1, keepdim=True)
-        # 复用原代码计算 w0, r0 (注意：原代码 calculate_aggregates 需要 helper)
-        # 我们这里为了简便，直接把 calculate_aggregates 的逻辑拿过来，或者调用 helper
-        x = 1 + 1 / config.theta_l
-        x_int_z1 = torch.exp(torch.tensor(1 / 2 * x * x * config.sigma_z ** 2))
-        x_int_z = torch.full_like(x_z0, x_int_z1).to(self.device)
+        # Precompute integral term (constant)
+        x_int_z_val = np.exp(0.5 * (1 + 1 / config.theta_l)**2 * config.sigma_z ** 2)
+        x_int_z = torch.full_like(x_z0, x_int_z_val)
         
         x_w0, x_l0, x_r0, x_y0 = self.obj_helper.calculate_aggregates(x_tfp0, x_z0, x_a0_total, x_int_z)
 
-        # 3. 决策 (Policy Choice at t)
-        # 构造输入向量
+        # Policy at t
         x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1)
         x_x0_policy_sd = module_basic_v1.normalize_inputs(x_x0_policy, config.bounds)
         x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
         
-        # 预测下一期资产 a' (归一化输出 -> 实际值)
-        # 注意：这里假设 model.f_policy 输出是归一化的 a'
         x_y0_policy = self.obj_helper.predict_model(x_x0_policy_sd, 'policy')
-        a_min, a_max = config.bounds["a"]["min"], config.bounds["a"]["max"]
-        x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min) # 解归一化
         
-        # 4. 计算当前消费 c_t
+        a_min, a_max = config.bounds["a"]["min"], config.bounds["a"]["max"]
+        x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min) # Next Asset
+        
+        # Consumption at t
         x_c0 = (1 + x_r0) * x_a0 + x_w0 * x_l0 * x_z0 - x_a1
-        x_c0 = torch.maximum(x_c0, torch.tensor(config.u_eps)) # 保证 c > 0
+        x_c0 = torch.maximum(x_c0, torch.tensor(config.u_eps))
 
         # ==========================
-        # Period t+1 (Next Period)
+        # 2. Prepare Next State (t+1) Common Parts
         # ==========================
-        # 5. 状态转移 (Transition)
-        # A. Idiosyncratic Shock z': LogNormal transition
+        # Distribution Evolution (Run once for the whole batch)
+        if config.i_dist == 1:
+            x_dist_g_all = self.obj_helper.calculate_G_batch(dist_a_mid, dist_a_mesh, x_dist0, x_tfp0)
+            x_dist0_reshaped = x_dist0.view(n_batch, config.k_dist, 1)
+            x_dist1 = torch.bmm(x_dist0_reshaped.transpose(1, 2), x_dist_g_all).transpose(1, 2).view(n_batch, config.k_dist)
+            # Boundary enforcement
+            dist_sampler = self.obj_helper.get_pdf_sampler()
+            x_dist1, _ = dist_sampler.dist_enforce_boundaries(x_dist1, config.a_pdf_penalty)
+        else:
+            x_dist1 = x_dist0
+
+        # Idiosyncratic Shock z' (Sampled once)
         z_min, z_max = config.bounds["z"]["min"], config.bounds["z"]["max"]
         x_z1 = module_basic_v1.bounded_log_normal_samples(config.mu_z, config.sigma_z, z_min, z_max, n_batch)
         x_z1 = x_z1.unsqueeze(1).to(self.device)
         
-        # B. Aggregate Shock TFP': Markov transition
-        transition_probs = tfp_transition[x_i_tfp0.squeeze()]
-        x_i_tfp1 = torch.multinomial(transition_probs, 1)
-        x_tfp1 = tfp_grid[x_i_tfp1.squeeze()].view(-1, 1)
-        
-        # C. Distribution Gamma': 使用 calculate_G_batch 计算分布演变
-        # 这一步是 KS 模型 DL 方法的关键：利用当前 Policy 预测整个分布的移动
-        if config.i_dist == 1:
-            x_dist_g_all = self.obj_helper.calculate_G_batch(dist_a_mid_tensor, dist_a_mesh, x_dist0, x_tfp0)
-            x_dist0_reshaped = x_dist0.view(n_batch, config.k_dist, 1)
-            # 矩阵乘法得到下一期分布
-            x_dist1 = torch.bmm(x_dist0_reshaped.transpose(1, 2), x_dist_g_all).transpose(1, 2).view(n_batch, config.k_dist)
-            # 强边界约束
-            x_dist1, _ = domain_sampler.dist_enforce_boundaries(x_dist1, config.a_pdf_penalty)
-        else:
-            x_dist1 = x_dist0 # 如果不更新分布（仅测试用）
-
-        # 6. 宏观聚合量 (Aggregates at t+1)
+        # Aggregates common inputs
         x_a1_total = (x_dist1 * dist_a_mid.T).sum(dim=1, keepdim=True)
-        # 注意：这里用 x_z1 (个体的z) 和 x_tfp1 (宏观的tfp)
-        x_w1, x_l1, x_r1, x_y1 = self.obj_helper.calculate_aggregates(x_tfp1, x_z1, x_a1_total, x_int_z) # int_z 近似不变
-
-        # 7. 决策 (Policy Choice at t+1)
-        # 我们需要预测 k_{t+2} (即 x_a2) 来算出 c_{t+1}
-        x_x1_policy = torch.cat([x_z1, x_a1, x_dist1], dim=1)
-        x_x1_policy_sd = module_basic_v1.normalize_inputs(x_x1_policy, config.bounds)
-        x_x1_policy_sd = torch.cat((x_tfp1, x_x1_policy_sd), dim=1)
-        
-        # 使用同一个 Policy Net 预测
-        x_y1_policy = self.obj_helper.predict_model(x_x1_policy_sd, 'policy')
-        x_a2 = x_y1_policy[:, 0].unsqueeze(1) * (a_max - a_min)
-        
-        # 8. 计算下一期消费 c_{t+1}
-        x_c1 = (1 + x_r1) * x_a1 + x_w1 * x_l1 * x_z1 - x_a2
-        x_c1 = torch.maximum(x_c1, torch.tensor(config.u_eps))
 
         # ==========================
-        # Euler Equation Loss
+        # 3. Vectorized Expectation Calculation (The Speedup)
         # ==========================
-        # u'(c) = c^(-sigma)
+        # Goal: Calculate E[RHS] by processing all 4 TFP branches in parallel
+        
+        # Expand inputs to shape [N * n_tfp, ...]
+        # repeat_interleave: [s1, s1, s1, s1, s2, s2, s2, s2 ...]
+        x_z1_rep = x_z1.repeat_interleave(n_tfp, dim=0) 
+        x_a1_rep = x_a1.repeat_interleave(n_tfp, dim=0)
+        x_dist1_rep = x_dist1.repeat_interleave(n_tfp, dim=0)
+        x_a1_total_rep = x_a1_total.repeat_interleave(n_tfp, dim=0)
+        x_int_z_rep = x_int_z.repeat_interleave(n_tfp, dim=0)
+        
+        # TFP grid repeated: [t0, t1, t2, t3, t0, t1, t2, t3 ...]
+        x_tfp1_rep = tfp_grid.repeat(n_batch, 1)
+        
+        # Calculate Aggregates for all branches at once
+        x_w1_all, x_l1_all, x_r1_all, _ = self.obj_helper.calculate_aggregates(x_tfp1_rep, x_z1_rep, x_a1_total_rep, x_int_z_rep)
+        
+        # Policy Prediction for all branches
+        x_x1_policy_rep = torch.cat([x_z1_rep, x_a1_rep, x_dist1_rep], dim=1)
+        x_x1_policy_sd_rep = module_basic_v1.normalize_inputs(x_x1_policy_rep, config.bounds)
+        x_x1_policy_sd_rep = torch.cat((x_tfp1_rep, x_x1_policy_sd_rep), dim=1)
+        
+        # Forward pass (Batch size is now N * 4)
+        x_y1_policy_rep = self.obj_helper.predict_model(x_x1_policy_sd_rep, 'policy')
+        x_a2_rep = x_y1_policy_rep[:, 0].unsqueeze(1) * (a_max - a_min)
+        
+        # Consumption at t+1
+        x_c1_rep = (1 + x_r1_all) * x_a1_rep + x_w1_all * x_l1_all * x_z1_rep - x_a2_rep
+        x_c1_rep = torch.maximum(x_c1_rep, torch.tensor(config.u_eps))
+        
+        # Marginal Utility
+        mu_next_rep = config.beta * (1 + x_r1_all - config.delta) * (x_c1_rep ** (-config.sigma))
+        
+        # Reshape back to [N, n_tfp] to compute expectation
+        mu_next_reshaped = mu_next_rep.view(n_batch, n_tfp)
+        
+        # Get transition probabilities [N, n_tfp]
+        probs = tfp_transition[x_i_tfp0.squeeze()]
+        
+        # Compute Expectation: dot product of probabilities and MU
+        # sum(probs * mu, dim=1)
+        rhs_expected = (probs * mu_next_reshaped).sum(dim=1, keepdim=True)
+
+        # ==========================
+        # 4. Loss Calculation
+        # ==========================
         lhs = x_c0 ** (-config.sigma)
-        rhs = config.beta * (1 + x_r1 - config.delta) * (x_c1 ** (-config.sigma))
+        residuals = 1 - rhs_expected / lhs
         
-        # 定义残差：可以是 (LHS - RHS)^2，也可以是 (1 - RHS/LHS)^2 (Unit-free)
-        # 通常 Unit-free 更稳定：
-        residuals = 1 - rhs / lhs
-        loss = torch.mean(residuals ** 2)
+        # Borrowing Constraint Handling
+        is_constrained = x_y0_policy[:, 0] < 1e-3
+        want_to_borrow = residuals > 0 # LHS > RHS means current C is too low (MU too high), want to borrow more
+        mask_ignore = is_constrained.unsqueeze(1) & want_to_borrow
         
+        weights = torch.ones_like(residuals)
+        weights[mask_ignore] = 0.0
+        
+        loss = torch.mean((weights * residuals) ** 2)
         return loss

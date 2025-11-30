@@ -101,10 +101,10 @@ for i_iter in range(config.num_iter):
     # training starts:
     '''bellman equation based'''
     # double check the value of "config.model_number_input"
-    decision_trainer = instantiate_trainer(config.i_training, model, config.model_number_input, i_save_iter,
-                                           use_pretrained=i_load_pretrainted)
-    model = decision_trainer.policy_bellman_training(config.n_p_sim, dist_a_mid, dist_a_mesh)
-    model = decision_trainer.value_training(config.n_v_sim, dist_a_mid, dist_a_mesh)
+    # decision_trainer = instantiate_trainer(config.i_training, model, config.model_number_input, i_save_iter,
+    #                                        use_pretrained=i_load_pretrainted)
+    # model = decision_trainer.policy_bellman_training(config.n_p_sim, dist_a_mid, dist_a_mesh)
+    # model = decision_trainer.value_training(config.n_v_sim, dist_a_mid, dist_a_mesh)
 
     # 实例化 DL Trainer
     dl_trainer = EulerTrainer(model, device)
