@@ -205,15 +205,13 @@ class EulerTrainer:
         
         lhs = x_c0 ** (-config.sigma)
         val_euler_diff = lhs - rhs_expected
-        
-        val_euler_relative = 1.0 - rhs_expected / lhs
 
         # 添加一个极小值 eps 防止 sqrt(0) 梯度 NaN
         eps = 1e-8
+        val_euler_relative = 1.0 - rhs_expected / (lhs + eps)
         fb_func = val_a_prime + val_euler_relative - torch.sqrt(val_a_prime**2 + val_euler_relative**2 + eps)
         
         # Loss 是 FB 函数的平方
         loss = torch.mean(fb_func ** 2)
         
-        return loss
         return loss

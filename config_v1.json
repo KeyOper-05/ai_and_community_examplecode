@@ -121,5 +121,5 @@
   "n_z_sample": 10,
   "n_sim_path": 2000,
   "n_sim_step": 100,
-  "n_burn": 1000
+  "n_burn": 100
 }
