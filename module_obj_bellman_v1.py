@@ -274,20 +274,22 @@ class define_objective:
 
     def sim_path(self, x_batch, x_n_sim, dist_a_mid, dist_a_mesh):
         """
-        Modified sim_path: Uses Monte Carlo simulation of N agents to track the real distribution.
-        This is much more stable and realistic than iteratively calculating G_batch.
+        Modified sim_path:
+        1. Uses Monte Carlo simulation with Linear Interpolation for distribution.
+        2. Calculates Aggregate Capital (K) using the TRUE MEAN of agents (fixes oscillation).
+        3. Adds momentum to Capital to stabilize interest rate.
         """
-        # 1. 设置模拟参数
-        num_agents = 30000  # 模拟1万个人，样本越多图越平滑
+        # 1. 设置模拟参数 (建议增加到 50000 人以保证精度)
+        num_agents = 50000
         
-        # 重新初始化状态 (不使用传入的 x_batch，而是重新生成更广泛的样本)
+        # 重新初始化状态
         z_min, z_max = self.ranges[0]
         a_min, a_max = self.ranges[1]
         
-        # A. 初始化资产 a0: 均匀分布在 [a_min, a_max]
+        # A. 初始化资产 a0
         x_a0 = torch.rand(num_agents, 1, device=self.device) * (a_max - a_min) * 0.5 + a_min
         
-        # B. 初始化冲击 z0: 对数正态分布
+        # B. 初始化冲击 z0
         x_z0 = module_basic_v1.bounded_log_normal_samples(
             config.mu_z, config.sigma_z, z_min, z_max, num_agents
         ).unsqueeze(1).to(self.device)
@@ -296,129 +298,119 @@ class define_objective:
         tfp_grid = torch.tensor(config.tfp_grid, device=self.device).view(-1, 1)
         tfp_transition = torch.tensor(config.tfp_transition, device=self.device).view(config.n_tfp, config.n_tfp)
         
-        # 随机选一个初始 TFP
         curr_tfp_idx = torch.randint(0, config.n_tfp, (1,)).item()
         x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
         
-        # 记录数据的列表
+        # 记录数据
         x_dist0_path = [] # 记录分布历史
         x_r0_path = []    # 记录利率历史
         x_tfp0_path = []  # 记录TFP历史
 
-        print(f"Starting Monte Carlo Simulation with {num_agents} agents for {x_n_sim} steps...")
+        # === 平滑参数 ===
+        k_smooth = None
+        momentum = 0.9  # 惯性系数，0.9 表示新的一期 K 有 90% 继承上一期，10% 来自当期计算
 
-        for sim_step in tqdm(range(x_n_sim),desc="MCS"):
+        print(f"Starting Monte Carlo Simulation with {num_agents} agents...")
+        
+        # 预处理 Grid (确保是 1D)
+        grid = dist_a_mid.flatten().to(self.device)
+        k_dist = config.k_dist
+
+        for sim_step in tqdm(range(x_n_sim), desc="MCS"):
 
             # -----------------------------------------------------------
-            # 1. 核心修正：使用“线性插值法”计算当前的真实分布 (更平滑)
+            # 1. 线性插值更新分布 (Linear Interpolation)
             # -----------------------------------------------------------
-            # 准备数据
-            assets = x_a0.squeeze(1)       # Shape: [num_agents]
-            grid = dist_a_mid.squeeze(1)   # Shape: [k_dist]
-            k_dist = config.k_dist
+            # 这一步是为了画图和给神经网络输入“分布状态”，必须平滑
+            assets = x_a0.flatten()
             
-            # 1. 截断资产范围以防越界 (Clamp assets within grid range)
-            assets_clipped = torch.clamp(assets, min=grid[0], max=grid[-1])
-            
-            # 2. 找到资产所在的区间索引
-            # searchsorted 找到满足 grid[i-1] <= val < grid[i] 的 i
-            # 我们需要 idx_lower 使得 grid[idx_lower] <= asset <= grid[idx_upper]
-            idx = torch.searchsorted(grid, assets_clipped, right=True)
+            # 找到资产在网格中的位置
+            idx = torch.searchsorted(grid, assets, right=True)
             idx_lower = torch.clamp(idx - 1, min=0, max=k_dist - 2)
             idx_upper = idx_lower + 1
             
-            # 3. 获取对应网格点的值
             val_lower = grid[idx_lower]
             val_upper = grid[idx_upper]
             
-            # 4. 计算权重 (线性插值)
-            # 距离越近，权重越大。 asset 离 lower 越近，分配给 lower 的权重越大? 
-            # 不，是 asset = w_up * val_up + w_low * val_low
-            # weight_upper = (asset - val_lower) / (val_upper - val_lower)
-            denom = val_upper - val_lower
-            denom = torch.where(denom < 1e-8, torch.ones_like(denom), denom) # 防止除以0
-            
-            weight_upper = (assets_clipped - val_lower) / denom
+            # 计算权重
+            denom = val_upper - val_lower + 1e-8
+            weight_upper = (assets - val_lower) / denom
+            weight_upper = torch.clamp(weight_upper, 0.0, 1.0)
             weight_lower = 1.0 - weight_upper
             
-            # 5. 聚合到分布中 (Scatter Add)
+            # 聚合分布
             current_dist = torch.zeros(1, k_dist, device=self.device)
-            
-            # 将 num_agents 个人的权重累加到对应的 bin 中
-            # unsqueeze(0) 是为了匹配 current_dist 的维度 [1, k_dist]
             current_dist.scatter_add_(1, idx_lower.unsqueeze(0), weight_lower.unsqueeze(0))
             current_dist.scatter_add_(1, idx_upper.unsqueeze(0), weight_upper.unsqueeze(0))
-            
-            # 归一化
             current_dist = current_dist / num_agents
             
-            # 扩展到所有 agent (大家看到的宏观分布是一样的)
+            # 扩展到所有 agent
             x_dist0 = current_dist.expand(num_agents, -1)
-            
-            # 记录用于画图
             x_dist0_path.append(current_dist)
 
             # -----------------------------------------------------------
-            # 2. 神经网络决策
+            # 2. 计算宏观变量 (修复震荡的核心步骤)
             # -----------------------------------------------------------
-            # 准备输入
-            x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1)
-            x_x0_policy_sd = module_basic_v1.normalize_inputs(x_x0_policy, config.bounds)
-            x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
-
-            # 计算宏观变量 (Aggregates)用于记录
-            # K = sum(density * mid_points)
-            x_a0_total = torch.mean(x_a0) 
             
-            # 注意：如果模型定义总资本是 Sum 而不是 Mean，请用 torch.sum(x_a0)
-            x_a0_total = x_a0_total.view(1, 1)
+            # A. 计算当期真实的资本均值 (不使用网格估算!)
+            k_current = torch.mean(x_a0).view(1, 1)
+            
+            # B. 应用惯性平滑 (Momentum)
+            if k_smooth is None:
+                k_smooth = k_current
+            else:
+                k_smooth = momentum * k_smooth + (1 - momentum) * k_current
+            
+            # 使用平滑后的 K 作为本期的总资本
+            x_a0_total = k_smooth
+
+            # 计算积分项 (常量)
             x_int_z_val = np.exp(0.5 * (1 + 1 / config.theta_l)**2 * config.sigma_z ** 2)
             x_int_z = torch.full_like(x_z0, x_int_z_val)
             
+            # 计算价格 (此时算出的 r0 将非常平滑)
             x_w0, x_l0, x_r0, x_y0 = self.calculate_aggregates(x_tfp0, x_z0, x_a0_total, x_int_z)
             
             # 记录数据
             x_r0_path.append(x_r0[0,0].item())
             x_tfp0_path.append(x_tfp0[0,0].item())
 
-            # 预测下一期资产
+            # -----------------------------------------------------------
+            # 3. 神经网络决策与状态更新
+            # -----------------------------------------------------------
+            x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1)
+            x_x0_policy_sd = module_basic_v1.normalize_inputs(x_x0_policy, config.bounds)
+            x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
+
             x_y0_policy = self.predict_model(x_x0_policy_sd, 'policy')
             x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min)
             
-            # -----------------------------------------------------------
-            # 3. 状态更新 (Transition to t+1)
-            # -----------------------------------------------------------
-            x_a0 = x_a1 # 资产更新
+            # 状态更新 (t -> t+1)
+            x_a0 = x_a1 
             
             # 冲击更新 z'
             x_z0 = module_basic_v1.bounded_log_normal_samples(
                 config.mu_z, config.sigma_z, z_min, z_max, num_agents
             ).unsqueeze(1).to(self.device)
             
-            # TFP 更新 (Markov Chain)
+            # TFP 更新
             probs = tfp_transition[curr_tfp_idx]
             curr_tfp_idx = torch.multinomial(probs, 1).item()
             x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
 
         # ==========================================
-        # 绘图部分
+        # 绘图部分 (保持原样)
         # ==========================================
         print("Simulation finished. Generating plots...")
-        
-        # 数据转换
-        x_dist0_path = torch.cat(x_dist0_path, dim=0).cpu().detach().numpy() # [Steps, k_dist]
+        x_dist0_path = torch.cat(x_dist0_path, dim=0).cpu().detach().numpy()
         dist_a_mid_np = dist_a_mid.squeeze().cpu().detach().numpy()
         n_burn = config.n_burn
         
-        # ----------------------
-        # Fig 1: 初始阶段分布演变
-        # ----------------------
+        # Fig 1
         fig21, ax21 = plt.subplots(figsize=(9, 6))
         num_plots = 5
         colors = plt.cm.viridis(np.linspace(0, 1, num_plots))
         markers = ['o', 'v', '^', '<', '>', 's']
-        
-        # 画前几步 (例如 0, 10, 20...)
         indices = range(0, min(x_n_sim, 50), 10) 
         for idx, i in enumerate(indices):
             if i >= x_dist0_path.shape[0]: break
@@ -426,7 +418,6 @@ class define_objective:
                      color=colors[idx % len(colors)], 
                      marker=markers[idx % len(markers)], 
                      label=f't = {i}')
-                     
         ax21.set_xlabel('Asset')
         ax21.set_ylabel('Density (Monte Carlo)')
         ax21.set_title('Distribution Evolution (Initial)')
@@ -434,21 +425,16 @@ class define_objective:
         fig21.savefig(f'figures/sim_path_initial_2d.png', dpi=300)
         plt.close(fig21)
 
-        # ----------------------
-        # Fig 2: 长期稳态分布演变
-        # ----------------------
+        # Fig 2
         fig22, ax22 = plt.subplots(figsize=(9, 6))
-        # 画最后几步
         start_idx = max(0, x_n_sim - 50)
         indices = range(start_idx, x_n_sim, 10)
-        
         for idx, i in enumerate(indices):
             if i >= x_dist0_path.shape[0]: break
             ax22.plot(dist_a_mid_np, x_dist0_path[i], 
                      color=colors[idx % len(colors)], 
                      marker=markers[idx % len(markers)], 
                      label=f't = {i}')
-        
         ax22.set_xlabel('Asset')
         ax22.set_ylabel('Density (Monte Carlo)')
         ax22.set_title('Distribution Evolution (Late Stage)')
@@ -456,12 +442,9 @@ class define_objective:
         fig22.savefig(f'figures/sim_path_2d.png', dpi=300)
         plt.close(fig22)
 
-        # ----------------------
-        # Fig 3: 宏观变量路径 [修复了 NameError]
-        # ----------------------
-        fig3, ax1 = plt.subplots(figsize=(9, 6)) # <--- 这一行定义了 ax1
+        # Fig 3
+        fig3, ax1 = plt.subplots(figsize=(9, 6))
         ax2 = ax1.twinx()
-        
         steps = np.arange(x_n_sim)[n_burn:]
         r_data = x_r0_path[n_burn:]
         tfp_data = x_tfp0_path[n_burn:]
@@ -469,16 +452,12 @@ class define_objective:
         if len(steps) > 0:
             ax1.plot(steps, r_data, 'k-.', label='Interest Rate (r)')
             ax2.plot(steps, tfp_data, 'r-*', label='TFP')
-            
             ax1.set_xlabel('Simulation Steps')
             ax1.set_ylabel('Interest Rate', color='k')
             ax2.set_ylabel('TFP', color='r')
-            # 合并图例
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax2.legend(lines + lines2, labels + labels2, loc="upper right")
-            
             fig3.savefig(f'figures/sim_path_aggregates.png')
-        
         plt.close(fig3)
         return
