@@ -275,20 +275,19 @@ class define_objective:
     def sim_path(self, x_batch, x_n_sim, dist_a_mid, dist_a_mesh):
         """
         Modified sim_path: Uses Monte Carlo simulation of N agents to track the real distribution.
-        This is much more stable than iteratively calculating G_batch.
+        This is much more stable and realistic than iteratively calculating G_batch.
         """
-        # 1. 增加代理人数量用于模拟 (Monte Carlo)
-        # 为了画出光滑的分布图，我们需要很多 Agents，比如 10,000 个
-        num_agents = 10000 
+        # 1. 设置模拟参数
+        num_agents = 10000  # 模拟1万个人，样本越多图越平滑
         
-        # 重新初始化状态
+        # 重新初始化状态 (不使用传入的 x_batch，而是重新生成更广泛的样本)
         z_min, z_max = self.ranges[0]
         a_min, a_max = self.ranges[1]
         
-        # A. 初始化资产 a0: 均匀分布或集中在某处
+        # A. 初始化资产 a0: 均匀分布在 [a_min, a_max]
         x_a0 = torch.rand(num_agents, 1, device=self.device) * (a_max - a_min) * 0.5 + a_min
         
-        # B. 初始化冲击 z0: 对数正态
+        # B. 初始化冲击 z0: 对数正态分布
         x_z0 = module_basic_v1.bounded_log_normal_samples(
             config.mu_z, config.sigma_z, z_min, z_max, num_agents
         ).unsqueeze(1).to(self.device)
@@ -302,61 +301,69 @@ class define_objective:
         x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
         
         # 记录数据的列表
-        x_dist0_path = [] # 记录分布
-        x_r0_path = []
-        x_tfp0_path = []
+        x_dist0_path = [] # 记录分布历史
+        x_r0_path = []    # 记录利率历史
+        x_tfp0_path = []  # 记录TFP历史
 
         print(f"Starting Monte Carlo Simulation with {num_agents} agents for {x_n_sim} steps...")
 
-        for sim_step in tqdm(range(x_n_sim), desc="Simulation Progress"):
-            # 1. 根据当前所有 Agent 的资产计算真实的分布 (Histogram)
-            # 这一步替代了不稳定的 calculate_G_batch
-            # 我们统计 x_a0 落在 dist_a_mid 定义的区间内的频率
+        for sim_step in range(x_n_sim):
+            # 进度打印
+            if sim_step % 100 == 0:
+                print(f"  > Simulating step {sim_step}/{x_n_sim}...")
+
+            # -----------------------------------------------------------
+            # 1. 核心修正：使用“统计法”计算当前的真实分布
+            # -----------------------------------------------------------
+            # 找到每个 agent 的资产最接近分布网格(dist_a_mid)中的哪一个点
+            # dist_a_mid shape: [k_dist, 1] -> 转置为 [1, k_dist]
+            # x_a0 shape: [num_agents, 1]
+            # distances shape: [num_agents, k_dist]
+            distances = torch.abs(x_a0 - dist_a_mid.T) 
+            nearest_idx = torch.argmin(distances, dim=1) # 每个agent属于哪个bin
             
-            # 使用 torch.histc 或类似的逻辑计算分布
-            # 为了与神经网络输入兼容，我们需要归一化的密度
-            # 这里我们使用简单的基于距离的软分配或者直接统计
-            
-            # 简单统计法：
-            # 找到每个 agent 的资产最接近哪个 grid point
-            distances = torch.abs(x_a0 - dist_a_mid.T) # [N_agents, k_dist]
-            nearest_idx = torch.argmin(distances, dim=1)
-            
-            # 计算频率
+            # 统计频率 (Histogram)
             current_dist = torch.zeros(1, config.k_dist, device=self.device)
             for k in range(config.k_dist):
-                current_dist[0, k] = (nearest_idx == k).float().sum()
+                count = (nearest_idx == k).float().sum()
+                current_dist[0, k] = count
             
-            # 归一化
+            # 归一化为概率密度
             current_dist = current_dist / num_agents
-            # 扩展到每个 agent (所有 agent 看到相同的宏观分布)
+            
+            # 扩展到所有 agent (大家看到的宏观分布是一样的)
             x_dist0 = current_dist.expand(num_agents, -1)
             
-            # 记录分布用于画图
+            # 记录用于画图
             x_dist0_path.append(current_dist)
 
-            # 2. 准备神经网络输入
+            # -----------------------------------------------------------
+            # 2. 神经网络决策
+            # -----------------------------------------------------------
+            # 准备输入
             x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1)
             x_x0_policy_sd = module_basic_v1.normalize_inputs(x_x0_policy, config.bounds)
             x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
 
-            # 3. 计算宏观变量 (Aggregates)
+            # 计算宏观变量 (Aggregates)用于记录
+            # K = sum(density * mid_points)
+            x_a0_total = (current_dist * dist_a_mid.T).sum()
             x_int_z_val = np.exp(0.5 * (1 + 1 / config.theta_l)**2 * config.sigma_z ** 2)
             x_int_z = torch.full_like(x_z0, x_int_z_val)
-            # 总资本 K = sum(distribution * mid_points)
-            x_a0_total = (current_dist * dist_a_mid.T).sum()
             
             x_w0, x_l0, x_r0, x_y0 = self.calculate_aggregates(x_tfp0, x_z0, x_a0_total, x_int_z)
             
-            # 记录宏观变量
+            # 记录数据
             x_r0_path.append(x_r0[0,0].item())
             x_tfp0_path.append(x_tfp0[0,0].item())
 
-            # 4. 代理人决策 (Policy)
+            # 预测下一期资产
             x_y0_policy = self.predict_model(x_x0_policy_sd, 'policy')
             x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min)
             
-            # 5. 状态更新 (Transition)
+            # -----------------------------------------------------------
+            # 3. 状态更新 (Transition to t+1)
+            # -----------------------------------------------------------
             x_a0 = x_a1 # 资产更新
             
             # 冲击更新 z'
@@ -370,23 +377,25 @@ class define_objective:
             x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
 
         # ==========================================
-        # 绘图部分 (保持原有的绘图逻辑，只需要适配数据格式)
+        # 绘图部分
         # ==========================================
+        print("Simulation finished. Generating plots...")
         
-        # 将 list 转为 tensor/numpy
+        # 数据转换
         x_dist0_path = torch.cat(x_dist0_path, dim=0).cpu().detach().numpy() # [Steps, k_dist]
         dist_a_mid_np = dist_a_mid.squeeze().cpu().detach().numpy()
-        
         n_burn = config.n_burn
         
+        # ----------------------
         # Fig 1: 初始阶段分布演变
+        # ----------------------
         fig21, ax21 = plt.subplots(figsize=(9, 6))
         num_plots = 5
         colors = plt.cm.viridis(np.linspace(0, 1, num_plots))
         markers = ['o', 'v', '^', '<', '>', 's']
         
-        # 画前几步
-        indices = range(0, min(x_n_sim, 500), 100) # 每100步画一次
+        # 画前几步 (例如 0, 10, 20...)
+        indices = range(0, min(x_n_sim, 50), 10) 
         for idx, i in enumerate(indices):
             if i >= x_dist0_path.shape[0]: break
             ax21.plot(dist_a_mid_np, x_dist0_path[i], 
@@ -401,10 +410,13 @@ class define_objective:
         fig21.savefig(f'figures/sim_path_initial_2d.png', dpi=300)
         plt.close(fig21)
 
+        # ----------------------
         # Fig 2: 长期稳态分布演变
+        # ----------------------
         fig22, ax22 = plt.subplots(figsize=(9, 6))
-        start_idx = max(0, x_n_sim - 500)
-        indices = range(start_idx, x_n_sim, 100)
+        # 画最后几步
+        start_idx = max(0, x_n_sim - 50)
+        indices = range(start_idx, x_n_sim, 10)
         
         for idx, i in enumerate(indices):
             if i >= x_dist0_path.shape[0]: break
@@ -420,8 +432,10 @@ class define_objective:
         fig22.savefig(f'figures/sim_path_2d.png', dpi=300)
         plt.close(fig22)
 
-        # Fig 3: 宏观变量路径
-        fig3, ax1 = plt.subplots(figsize=(9, 6))
+        # ----------------------
+        # Fig 3: 宏观变量路径 [修复了 NameError]
+        # ----------------------
+        fig3, ax1 = plt.subplots(figsize=(9, 6)) # <--- 这一行定义了 ax1
         ax2 = ax1.twinx()
         
         steps = np.arange(x_n_sim)[n_burn:]
@@ -435,7 +449,11 @@ class define_objective:
             ax1.set_xlabel('Simulation Steps')
             ax1.set_ylabel('Interest Rate', color='k')
             ax2.set_ylabel('TFP', color='r')
-            fig3.legend(loc="upper right")
+            # 合并图例
+            lines, labels = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax2.legend(lines + lines2, labels + labels2, loc="upper right")
+            
             fig3.savefig(f'figures/sim_path_aggregates.png')
         
         plt.close(fig3)
