@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import module_basic_v1
+from tqdm import tqdm
 
 # import configuration data:
 config = module_basic_v1.Config("config_v1.json")
@@ -307,7 +308,7 @@ class define_objective:
 
         print(f"Starting Monte Carlo Simulation with {num_agents} agents for {x_n_sim} steps...")
 
-        for sim_step in range(x_n_sim):
+        for sim_step in tqdm(range(x_n_sim), desc="Simulation Progress"):
             # 1. 根据当前所有 Agent 的资产计算真实的分布 (Histogram)
             # 这一步替代了不稳定的 calculate_G_batch
             # 我们统计 x_a0 落在 dist_a_mid 定义的区间内的频率
