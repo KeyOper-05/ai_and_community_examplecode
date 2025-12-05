@@ -272,186 +272,169 @@ class define_objective:
         return cdf
 
     def sim_path(self, x_batch, x_n_sim, dist_a_mid, dist_a_mesh):
-        pdf_sampler = self.get_pdf_sampler()
-        x_beta = config.beta
-        all_variables = ["z", "a", "dist_a"]
-        z_index = all_variables.index("z")
-        z_min, z_max = self.ranges[z_index]
-        a_index = all_variables.index("a")
-        a_min, a_max = self.ranges[a_index]
-        tfp_grid = torch.tensor(config.tfp_grid).view(-1, 1)
-        tfp_transition = torch.tensor(config.tfp_transition).view(config.n_tfp, config.n_tfp)
+        """
+        Modified sim_path: Uses Monte Carlo simulation of N agents to track the real distribution.
+        This is much more stable than iteratively calculating G_batch.
+        """
+        # 1. 增加代理人数量用于模拟 (Monte Carlo)
+        # 为了画出光滑的分布图，我们需要很多 Agents，比如 10,000 个
+        num_agents = 10000 
+        
+        # 重新初始化状态
+        z_min, z_max = self.ranges[0]
+        a_min, a_max = self.ranges[1]
+        
+        # A. 初始化资产 a0: 均匀分布或集中在某处
+        x_a0 = torch.rand(num_agents, 1, device=self.device) * (a_max - a_min) * 0.5 + a_min
+        
+        # B. 初始化冲击 z0: 对数正态
+        x_z0 = module_basic_v1.bounded_log_normal_samples(
+            config.mu_z, config.sigma_z, z_min, z_max, num_agents
+        ).unsqueeze(1).to(self.device)
+        
+        # C. 初始化宏观 TFP
+        tfp_grid = torch.tensor(config.tfp_grid, device=self.device).view(-1, 1)
+        tfp_transition = torch.tensor(config.tfp_transition, device=self.device).view(config.n_tfp, config.n_tfp)
+        
+        # 随机选一个初始 TFP
+        curr_tfp_idx = torch.randint(0, config.n_tfp, (1,)).item()
+        x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
+        
+        # 记录数据的列表
+        x_dist0_path = [] # 记录分布
+        x_r0_path = []
+        x_tfp0_path = []
 
-        x_z1, x_a1, x_dist1 = self.extract_state_variables(x_batch)
-        x_i_tfp1 = torch.randint(low=0, high=config.n_tfp, size=x_z1.size())
-        x_tfp1 = tfp_grid[x_i_tfp1.squeeze()].view(-1, 1).to(self.device)
-
-        # Initialize path tensors
-        x_i_tfp0_path, x_tfp0_path, x_z0_path, x_a0_path, x_dist0_path = [], [], [], [], []
-        x_w0_path, x_l0_path, x_r0_path, x_y0_path = [], [], [], []
+        print(f"Starting Monte Carlo Simulation with {num_agents} agents for {x_n_sim} steps...")
 
         for sim_step in range(x_n_sim):
-            x_i_tfp0, x_tfp0, x_z0, x_a0, x_dist0 = x_i_tfp1.clone(), x_tfp1.clone(), x_z1.clone(), x_a1.clone(), x_dist1.clone()
-            # Record the values at each step
-            x_i_tfp0_path.append(x_i_tfp0)
-            x_tfp0_path.append(x_tfp0)
-            x_z0_path.append(x_z0)
-            x_a0_path.append(x_a0)
-            x_dist0_path.append(x_dist0)
+            # 1. 根据当前所有 Agent 的资产计算真实的分布 (Histogram)
+            # 这一步替代了不稳定的 calculate_G_batch
+            # 我们统计 x_a0 落在 dist_a_mid 定义的区间内的频率
+            
+            # 使用 torch.histc 或类似的逻辑计算分布
+            # 为了与神经网络输入兼容，我们需要归一化的密度
+            # 这里我们使用简单的基于距离的软分配或者直接统计
+            
+            # 简单统计法：
+            # 找到每个 agent 的资产最接近哪个 grid point
+            distances = torch.abs(x_a0 - dist_a_mid.T) # [N_agents, k_dist]
+            nearest_idx = torch.argmin(distances, dim=1)
+            
+            # 计算频率
+            current_dist = torch.zeros(1, config.k_dist, device=self.device)
+            for k in range(config.k_dist):
+                current_dist[0, k] = (nearest_idx == k).float().sum()
+            
+            # 归一化
+            current_dist = current_dist / num_agents
+            # 扩展到每个 agent (所有 agent 看到相同的宏观分布)
+            x_dist0 = current_dist.expand(num_agents, -1)
+            
+            # 记录分布用于画图
+            x_dist0_path.append(current_dist)
 
-            x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1).to(self.device)
+            # 2. 准备神经网络输入
+            x_x0_policy = torch.cat([x_z0, x_a0, x_dist0], dim=1)
             x_x0_policy_sd = module_basic_v1.normalize_inputs(x_x0_policy, config.bounds)
             x_x0_policy_sd = torch.cat((x_tfp0, x_x0_policy_sd), dim=1)
 
-            x = 1 + 1 / config.theta_l
-            x_int_z1 = torch.exp(torch.tensor(1 / 2 * x * x * config.sigma_z ** 2))
-            x_int_z = torch.full_like(x_z0, x_int_z1).to(self.device)
-            x_a0_total = (x_dist0 * dist_a_mid.T).sum(dim=1, keepdim=True)
+            # 3. 计算宏观变量 (Aggregates)
+            x_int_z_val = np.exp(0.5 * (1 + 1 / config.theta_l)**2 * config.sigma_z ** 2)
+            x_int_z = torch.full_like(x_z0, x_int_z_val)
+            # 总资本 K = sum(distribution * mid_points)
+            x_a0_total = (current_dist * dist_a_mid.T).sum()
+            
             x_w0, x_l0, x_r0, x_y0 = self.calculate_aggregates(x_tfp0, x_z0, x_a0_total, x_int_z)
+            
+            # 记录宏观变量
+            x_r0_path.append(x_r0[0,0].item())
+            x_tfp0_path.append(x_tfp0[0,0].item())
 
-            # Add aggregate values to the lists
-            x_w0_path.append(x_w0)
-            x_l0_path.append(x_l0)
-            x_r0_path.append(x_r0)
-            x_y0_path.append(x_y0)
-
-            if isinstance(self.model, torch.nn.DataParallel):
-                x_y0_policy = self.model.module.f_policy(x_x0_policy_sd)
-            else:
-                x_y0_policy = self.model.f_policy(x_x0_policy_sd)
-
+            # 4. 代理人决策 (Policy)
+            x_y0_policy = self.predict_model(x_x0_policy_sd, 'policy')
             x_a1 = x_y0_policy[:, 0].unsqueeze(1) * (a_max - a_min)
-            x_c0 = (1 + x_r0) * x_a0 + x_w0 * x_l0 * x_z0 - x_a1
+            
+            # 5. 状态更新 (Transition)
+            x_a0 = x_a1 # 资产更新
+            
+            # 冲击更新 z'
+            x_z0 = module_basic_v1.bounded_log_normal_samples(
+                config.mu_z, config.sigma_z, z_min, z_max, num_agents
+            ).unsqueeze(1).to(self.device)
+            
+            # TFP 更新 (Markov Chain)
+            probs = tfp_transition[curr_tfp_idx]
+            curr_tfp_idx = torch.multinomial(probs, 1).item()
+            x_tfp0 = tfp_grid[curr_tfp_idx].view(1, 1).expand(num_agents, 1)
 
-            z_lower_bound, z_upper_bound = config.get_z_bounds()
-            x_z1 = module_basic_v1.bounded_log_normal_samples(config.mu_z, config.sigma_z, z_lower_bound, z_upper_bound,
-                                                              x_z0.size(0))
-            x_z1 = x_z1.unsqueeze(1).to(self.device)
-            # First, gather the transition probabilities for each current state in x_tfp0
-            transition_probs_for_x_tfp0 = tfp_transition[x_i_tfp0.squeeze()]
-            x_i_tfp1 = torch.multinomial(transition_probs_for_x_tfp0, 1).unsqueeze(1)
-            random_tfp = torch.normal(mean=0, std=config.eps_tfp, size=(1,)).to(self.device)
-            x_tfp1 = torch.exp(config.rho_tfp * torch.log(x_tfp0) + random_tfp)
-
-            if config.i_dist == 1:
-                n_batch, n_dim = x_dist0.shape
-                x_dist_g_all = self.calculate_G_batch(dist_a_mid, dist_a_mesh, x_dist0, x_tfp0)
-                x_dist0_reshaped = x_dist0.view(n_batch, n_dim, 1)
-                x_dist1 = torch.bmm(x_dist0_reshaped.transpose(1, 2), x_dist_g_all).transpose(1, 2).view(n_batch, n_dim)
-
-            elif config.i_dist == 0:
-                x_dist1 = x_dist0
-                n_batch, n_dim = x_dist0.shape
-                x_dist1 = pdf_sampler.generate_samples_a_pdf(n_batch, n_dim)
-
-        # Convert lists to tensors
-        x_z0_path = torch.cat(x_z0_path, dim=0)
-        x_a0_path = torch.cat(x_a0_path, dim=0)
-        x_dist0_path = torch.cat(x_dist0_path, dim=0)
-
-        # Ensure both tensors have the same dtype
-        dist_a_mid_tensor = dist_a_mid.squeeze().to(dtype=torch.float32)
-        sim_steps_tensor = torch.arange(x_n_sim, dtype=torch.float32)
-
-        # Plotting
-        n_burn = config.n_burn  # Specify the number of elements to truncate
-
-        ####################################################################
-        # Fig. 1: path for distribution -- 2D, initial periods
-        ####################################################################
+        # ==========================================
+        # 绘图部分 (保持原有的绘图逻辑，只需要适配数据格式)
+        # ==========================================
+        
+        # 将 list 转为 tensor/numpy
+        x_dist0_path = torch.cat(x_dist0_path, dim=0).cpu().detach().numpy() # [Steps, k_dist]
+        dist_a_mid_np = dist_a_mid.squeeze().cpu().detach().numpy()
+        
+        n_burn = config.n_burn
+        
+        # Fig 1: 初始阶段分布演变
         fig21, ax21 = plt.subplots(figsize=(9, 6))
-
-        # Determine the number of plots you will create
-        num_plots = 5  # Adjust this to change the number of steps you plot
-
-        # Generate a color for each plot
+        num_plots = 5
         colors = plt.cm.viridis(np.linspace(0, 1, num_plots))
-
-        # Define a list of markers you want to use
-        markers = ['o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', 'D', 'd']
-
-        # Calculate the indices based on the desired number of plots and steps between each plot
-        # We are now starting from the beginning of the dataset
-        indices = range(1, min(x_dist0_path.shape[0], num_plots * config.n_sim_step), config.n_sim_step)
-
-        # Loop through selected elements of x_dist0_path
-        for idx, (i, marker) in enumerate(zip(indices, markers)):
-            X = dist_a_mid_tensor.detach().cpu().numpy()
-            Y = x_dist0_path[i, :].detach().cpu().numpy()
-            # Use the index to cycle through markers and colors, avoiding an out-of-index error
-            ax21.plot(X, Y, color=colors[idx % len(colors)], marker=marker, label=f't = {i}')
-
+        markers = ['o', 'v', '^', '<', '>', 's']
+        
+        # 画前几步
+        indices = range(0, min(x_n_sim, 500), 100) # 每100步画一次
+        for idx, i in enumerate(indices):
+            if i >= x_dist0_path.shape[0]: break
+            ax21.plot(dist_a_mid_np, x_dist0_path[i], 
+                     color=colors[idx % len(colors)], 
+                     marker=markers[idx % len(markers)], 
+                     label=f't = {i}')
+                     
         ax21.set_xlabel('Asset')
-        ax21.set_ylabel('Density')
-        ax21.legend(loc='best', ncol=2)  # Adjust number of columns in legend if needed
-
-        #plt.show()
-        fig21.savefig(f'figures/sim_path_initial_2d.png', dpi=600)
+        ax21.set_ylabel('Density (Monte Carlo)')
+        ax21.set_title('Distribution Evolution (Initial)')
+        ax21.legend()
+        fig21.savefig(f'figures/sim_path_initial_2d.png', dpi=300)
         plt.close(fig21)
 
-        ####################################################################
-        # Fig. 2: path for distribution -- 2D
-        ####################################################################
+        # Fig 2: 长期稳态分布演变
         fig22, ax22 = plt.subplots(figsize=(9, 6))
-
-        # Determine the number of plots you will create
-        num_plots = 5  # Adjust this to change the number of steps you plot
-
-        # Generate a color for each plot
-        colors = plt.cm.viridis(np.linspace(0, 1, num_plots))
-
-        # Define a list of markers you want to use
-        markers = ['o', 'v', '^', '<', '>', 's', 'p', '*', 'h', 'H', 'D', 'd']
-
-        # Calculate the starting index based on the desired number of plots and steps between each plot
-        start_index = max(0, x_dist0_path.shape[0] - num_plots * config.n_sim_step)
-        indices = range(start_index, x_dist0_path.shape[0], config.n_sim_step)
-
-        # Loop through selected elements of x_dist0_path
-        for idx, (i, marker) in enumerate(zip(indices, markers)):
-            X = dist_a_mid_tensor.detach().cpu().numpy()
-            Y = x_dist0_path[i, :].detach().cpu().numpy()
-            # Use the index to cycle through markers and colors, avoiding an out-of-index error
-            ax22.plot(X, Y, color=colors[idx % len(colors)], marker=marker, label=f't = {i}')
-
+        start_idx = max(0, x_n_sim - 500)
+        indices = range(start_idx, x_n_sim, 100)
+        
+        for idx, i in enumerate(indices):
+            if i >= x_dist0_path.shape[0]: break
+            ax22.plot(dist_a_mid_np, x_dist0_path[i], 
+                     color=colors[idx % len(colors)], 
+                     marker=markers[idx % len(markers)], 
+                     label=f't = {i}')
+        
         ax22.set_xlabel('Asset')
-        ax22.set_ylabel('Density')
-        ax22.legend(loc='best', ncol=2)  # Adjust number of columns in legend if needed
-
-        #plt.show()
-        fig22.savefig(f'figures/sim_path_2d.png', dpi=600)
+        ax22.set_ylabel('Density (Monte Carlo)')
+        ax22.set_title('Distribution Evolution (Late Stage)')
+        ax22.legend()
+        fig22.savefig(f'figures/sim_path_2d.png', dpi=300)
         plt.close(fig22)
 
-
-        # New code for third plot
-        fig3, ax1 = plt.subplots(figsize=(9, 6))
+        # Fig 3: 宏观变量路径         fig3, ax1 = plt.subplots(figsize=(9, 6))
         ax2 = ax1.twinx()
-
-        # Convert lists to tensors or arrays for plotting
-
-        x_w0_array = torch.cat(x_w0_path, dim=0).detach().cpu().numpy()[n_burn:]
-        x_l0_array = torch.cat(x_l0_path, dim=0).detach().cpu().numpy()[n_burn:]
-        x_r0_array = torch.cat(x_r0_path, dim=0).detach().cpu().numpy()[n_burn:]
-        x_y0_array = torch.cat(x_y0_path, dim=0).detach().cpu().numpy()[n_burn:]
-        x_tfp0_array = torch.cat(x_tfp0_path, dim=0).detach().cpu().numpy()[n_burn:]
-        sim_steps_array = np.arange(x_n_sim)[n_burn:]
-
-        # Plot each aggregate
-        #ax3.plot(sim_steps_array, x_w0_array, label='x_w0')
-        #ax3.plot(sim_steps_array, x_l0_array, label='x_l0')
-        #ax3.plot(sim_steps_array, x_y0_array, label='x_y0')
-
-        ax1.plot(sim_steps_array, x_r0_array, 'k-.', label='x_r0')  # Green line with circle markers
-        ax2.plot(sim_steps_array, x_tfp0_array, 'r-*', label='x_tfp0')  # Magenta line with triangle markers
-
-        # Labels and Legend
-        ax1.set_xlabel('Simulation Steps')
-        ax1.set_ylabel('x_r0', color='b')
-        ax2.set_ylabel('x_tfp0', color='r')
-        fig3.legend(loc="upper right")
-
-        #plt.show()
-        fig3.savefig(f'figures/sim_path_aggregates.png')
+        
+        steps = np.arange(x_n_sim)[n_burn:]
+        r_data = x_r0_path[n_burn:]
+        tfp_data = x_tfp0_path[n_burn:]
+        
+        if len(steps) > 0:
+            ax1.plot(steps, r_data, 'k-.', label='Interest Rate (r)')
+            ax2.plot(steps, tfp_data, 'r-*', label='TFP')
+            
+            ax1.set_xlabel('Simulation Steps')
+            ax1.set_ylabel('Interest Rate', color='k')
+            ax2.set_ylabel('TFP', color='r')
+            fig3.legend(loc="upper right")
+            fig3.savefig(f'figures/sim_path_aggregates.png')
+        
         plt.close(fig3)
-
         return
