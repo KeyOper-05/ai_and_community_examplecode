@@ -278,7 +278,7 @@ class define_objective:
         This is much more stable and realistic than iteratively calculating G_batch.
         """
         # 1. 设置模拟参数
-        num_agents = 10000  # 模拟1万个人，样本越多图越平滑
+        num_agents = 30000  # 模拟1万个人，样本越多图越平滑
         
         # 重新初始化状态 (不使用传入的 x_batch，而是重新生成更广泛的样本)
         z_min, z_max = self.ranges[0]
@@ -310,22 +310,46 @@ class define_objective:
         for sim_step in tqdm(range(x_n_sim),desc="MCS"):
 
             # -----------------------------------------------------------
-            # 1. 核心修正：使用“统计法”计算当前的真实分布
+            # 1. 核心修正：使用“线性插值法”计算当前的真实分布 (更平滑)
             # -----------------------------------------------------------
-            # 找到每个 agent 的资产最接近分布网格(dist_a_mid)中的哪一个点
-            # dist_a_mid shape: [k_dist, 1] -> 转置为 [1, k_dist]
-            # x_a0 shape: [num_agents, 1]
-            # distances shape: [num_agents, k_dist]
-            distances = torch.abs(x_a0 - dist_a_mid.T) 
-            nearest_idx = torch.argmin(distances, dim=1) # 每个agent属于哪个bin
+            # 准备数据
+            assets = x_a0.squeeze(1)       # Shape: [num_agents]
+            grid = dist_a_mid.squeeze(1)   # Shape: [k_dist]
+            k_dist = config.k_dist
             
-            # 统计频率 (Histogram)
-            current_dist = torch.zeros(1, config.k_dist, device=self.device)
-            for k in range(config.k_dist):
-                count = (nearest_idx == k).float().sum()
-                current_dist[0, k] = count
+            # 1. 截断资产范围以防越界 (Clamp assets within grid range)
+            assets_clipped = torch.clamp(assets, min=grid[0], max=grid[-1])
             
-            # 归一化为概率密度
+            # 2. 找到资产所在的区间索引
+            # searchsorted 找到满足 grid[i-1] <= val < grid[i] 的 i
+            # 我们需要 idx_lower 使得 grid[idx_lower] <= asset <= grid[idx_upper]
+            idx = torch.searchsorted(grid, assets_clipped, right=True)
+            idx_lower = torch.clamp(idx - 1, min=0, max=k_dist - 2)
+            idx_upper = idx_lower + 1
+            
+            # 3. 获取对应网格点的值
+            val_lower = grid[idx_lower]
+            val_upper = grid[idx_upper]
+            
+            # 4. 计算权重 (线性插值)
+            # 距离越近，权重越大。 asset 离 lower 越近，分配给 lower 的权重越大? 
+            # 不，是 asset = w_up * val_up + w_low * val_low
+            # weight_upper = (asset - val_lower) / (val_upper - val_lower)
+            denom = val_upper - val_lower
+            denom = torch.where(denom < 1e-8, torch.ones_like(denom), denom) # 防止除以0
+            
+            weight_upper = (assets_clipped - val_lower) / denom
+            weight_lower = 1.0 - weight_upper
+            
+            # 5. 聚合到分布中 (Scatter Add)
+            current_dist = torch.zeros(1, k_dist, device=self.device)
+            
+            # 将 num_agents 个人的权重累加到对应的 bin 中
+            # unsqueeze(0) 是为了匹配 current_dist 的维度 [1, k_dist]
+            current_dist.scatter_add_(1, idx_lower.unsqueeze(0), weight_lower.unsqueeze(0))
+            current_dist.scatter_add_(1, idx_upper.unsqueeze(0), weight_upper.unsqueeze(0))
+            
+            # 归一化
             current_dist = current_dist / num_agents
             
             # 扩展到所有 agent (大家看到的宏观分布是一样的)
@@ -344,7 +368,10 @@ class define_objective:
 
             # 计算宏观变量 (Aggregates)用于记录
             # K = sum(density * mid_points)
-            x_a0_total = (current_dist * dist_a_mid.T).sum()
+            x_a0_total = torch.mean(x_a0) 
+            
+            # 注意：如果模型定义总资本是 Sum 而不是 Mean，请用 torch.sum(x_a0)
+            x_a0_total = x_a0_total.view(1, 1)
             x_int_z_val = np.exp(0.5 * (1 + 1 / config.theta_l)**2 * config.sigma_z ** 2)
             x_int_z = torch.full_like(x_z0, x_int_z_val)
             
