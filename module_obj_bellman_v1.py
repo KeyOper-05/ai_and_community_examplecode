@@ -307,10 +307,7 @@ class define_objective:
 
         print(f"Starting Monte Carlo Simulation with {num_agents} agents for {x_n_sim} steps...")
 
-        for sim_step in range(x_n_sim):
-            # 进度打印
-            if sim_step % 100 == 0:
-                print(f"  > Simulating step {sim_step}/{x_n_sim}...")
+        for sim_step in tqdm(range(x_n_sim),desc="MCS"):
 
             # -----------------------------------------------------------
             # 1. 核心修正：使用“统计法”计算当前的真实分布

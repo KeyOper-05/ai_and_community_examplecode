@@ -16,8 +16,8 @@
 
   "//comment": "training NN related",
   "num_iter": 5,
-  "num_samples_policy": 5000,
-  "num_samples_value": 5000,
+  "num_samples_policy": 50000,
+  "num_samples_value": 50000,
   "num_epochs_draw": 1,
   "num_epochs_initial": 1,
   "num_epochs_v": 10,
@@ -119,7 +119,7 @@
 
   "//": "# simulations",
   "n_z_sample": 10,
-  "n_sim_path": 1100,
+  "n_sim_path": 2000,
   "n_sim_step": 100,
-  "n_burn": 100
+  "n_burn": 1000
 }

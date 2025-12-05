@@ -112,7 +112,7 @@ for i_iter in range(config.num_iter):
     # 开始训练 (替代原来的 policy_bellman_training 和 value_training)
     # 注意：DL 方法只需要训练 Policy Network，不需要 Value Network
     model = dl_trainer.train_euler(
-        num_epochs=20,             # 可以根据收敛情况调整
+        num_epochs=100,             # 可以根据收敛情况调整
         batch_size=config.batch_size_p,
         dist_a_mid=dist_a_mid_values,
         dist_a_mesh=dist_a_mesh
