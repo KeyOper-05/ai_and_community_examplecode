@@ -420,7 +420,8 @@ class define_objective:
         fig22.savefig(f'figures/sim_path_2d.png', dpi=300)
         plt.close(fig22)
 
-        # Fig 3: 宏观变量路径         fig3, ax1 = plt.subplots(figsize=(9, 6))
+        # Fig 3: 宏观变量路径
+        fig3, ax1 = plt.subplots(figsize=(9, 6))
         ax2 = ax1.twinx()
         
         steps = np.arange(x_n_sim)[n_burn:]
